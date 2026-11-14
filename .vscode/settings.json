@@ -17,5 +17,6 @@
   ],
   "idf.currentSetup": "C:/Espressif/frameworks/esp-idf-v5.5.5/",
   "idf.flashType": "UART",
-  "idf.port": "COM8"
+  "idf.port": "COM8",
+  "cmake.sourceDirectory": "C:/Users/ASUS/project-name/main"
 }

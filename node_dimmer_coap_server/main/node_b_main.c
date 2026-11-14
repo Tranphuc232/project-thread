@@ -32,8 +32,16 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 #include "esp_err.h"
@@ -55,6 +63,8 @@
 #include "openthread/ip6.h"
 #include "openthread/message.h"
 #include "openthread/thread.h"
+#include "openthread/srp_client.h"
+#include "openthread/joiner.h"
 #include "ot_examples_common.h"
 
 #define TAG             "NODE_DIMMER"
@@ -102,21 +112,30 @@ static void dimmer_pwm_init(void)
              DIMMER_GPIO, LEDC_FREQUENCY);
 }
 
-static void dimmer_set_brightness(int brightness)
+static esp_err_t dimmer_set_brightness(int brightness)
 {
     if (brightness < 0) brightness = 0;
     if (brightness > 100) brightness = 100;
 
     /* Cong thuc: duty = brightness * 1023 / 100 */
     uint32_t duty = (uint32_t)(brightness * LEDC_MAX_DUTY / 100);
-    ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty));
-    ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
+    esp_err_t err = ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ledc_set_duty failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ledc_update_duty failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     s_current_brightness = brightness;
     ESP_LOGI(TAG, "============================================");
     ESP_LOGI(TAG, "  LIGHT level = %d%% | PWM duty = %lu",
              s_current_brightness, (unsigned long)duty);
     ESP_LOGI(TAG, "============================================");
+    return ESP_OK;
 }
 
 /* ========================================================================= */
@@ -151,13 +170,21 @@ static void light_request_handler(void *aContext, otMessage *aMessage,
                                                     resp_type,
                                                     OT_COAP_CODE_CONTENT);
             if (err == OT_ERROR_NONE) {
-                otCoapMessageSetPayloadMarker(response);
-                char resp_text[16];
-                snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
-                otMessageAppend(response, resp_text, (uint16_t)strlen(resp_text));
-                otCoapSendResponse(instance, response, aMessageInfo);
+                err = otCoapMessageSetPayloadMarker(response);
+            }
+            char resp_text[16];
+            snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
+            if (err == OT_ERROR_NONE) {
+                err = otMessageAppend(response, resp_text, (uint16_t)strlen(resp_text));
+            }
+            if (err == OT_ERROR_NONE) {
+                err = otCoapSendResponse(instance, response, aMessageInfo);
+            }
+
+            if (err == OT_ERROR_NONE) {
                 ESP_LOGI(TAG, "Sent CoAP 2.05 CONTENT: \"%s\"", resp_text);
             } else {
+                ESP_LOGE(TAG, "Failed to send 2.05 response: %d", err);
                 otMessageFree(response);
             }
         }
@@ -166,55 +193,91 @@ static void light_request_handler(void *aContext, otMessage *aMessage,
 
     /* --- 2. Xu ly lenh PUT hoac POST: Chinh do sang --- */
     if (code == OT_COAP_CODE_PUT || code == OT_COAP_CODE_POST) {
-        /* Doc payload */
+        /* Doc va kiem tra do dai payload */
         char     payload[16] = {0};
         uint16_t offset = otMessageGetOffset(aMessage);
-        uint16_t length = otMessageGetLength(aMessage) - offset;
-        if (length > sizeof(payload) - 1) {
-            length = sizeof(payload) - 1;
-        }
-        otMessageRead(aMessage, offset, payload, length);
-        payload[length] = '\0';
+        uint16_t total  = otMessageGetLength(aMessage);
+        bool     valid  = true;
+        int      new_brightness = 0;
 
-        /* Parse integer 0..100 */
-        char *endptr = NULL;
-        long val = strtol(payload, &endptr, 10);
-        bool valid = true;
-
-        /* Kiem tra tinh hop le cua chuoi so va khoang gia tri 0..100 */
-        if (endptr == payload || (*endptr != '\0' && *endptr != '\r' && *endptr != '\n' && *endptr != ' ')) {
+        if (offset > total) {
             valid = false;
-        } else if (val < 0 || val > 100) {
-            valid = false;
-        }
-
-        if (valid) {
-            dimmer_set_brightness((int)val);
         } else {
+            uint16_t length = total - offset;
+            if (length == 0 || length >= sizeof(payload)) {
+                ESP_LOGW(TAG, "Invalid payload length: %u bytes", (unsigned)length);
+                valid = false;
+            } else {
+                uint16_t bytes_read = otMessageRead(aMessage, offset, payload, length);
+                if (bytes_read != length) {
+                    ESP_LOGW(TAG, "Payload read incomplete: %u/%u bytes", (unsigned)bytes_read, (unsigned)length);
+                    valid = false;
+                } else {
+                    payload[length] = '\0';
+                }
+            }
+        }
+
+        /* Parse so nguyen 0..100, kiem tra ERANGE va khong cho phep ky tu thua sau khoang trang */
+        if (valid) {
+            char *endptr = NULL;
+            errno = 0;
+            long val = strtol(payload, &endptr, 10);
+            if (errno == ERANGE || endptr == payload) {
+                valid = false;
+            } else {
+                while (*endptr == ' ' || *endptr == '\t' || *endptr == '\r' || *endptr == '\n') {
+                    endptr++;
+                }
+                if (*endptr != '\0' || val < 0 || val > 100) {
+                    valid = false;
+                } else {
+                    new_brightness = (int)val;
+                }
+            }
+        }
+
+        otCoapCode resp_code = OT_COAP_CODE_CHANGED;
+        if (!valid) {
+            resp_code = OT_COAP_CODE_BAD_REQUEST;
             ESP_LOGW(TAG, "Invalid payload: \"%s\" (expected integer 0..100)", payload);
+        } else {
+            esp_err_t set_err = dimmer_set_brightness(new_brightness);
+            if (set_err != ESP_OK) {
+                resp_code = OT_COAP_CODE_INTERNAL_ERROR; /* 5.00 */
+                ESP_LOGE(TAG, "Failed to set dimmer brightness: %s", esp_err_to_name(set_err));
+            }
         }
 
         /* Gui CoAP response (ACK) neu client yeu cau Confirmable */
         if (type == OT_COAP_TYPE_CONFIRMABLE) {
             otMessage *response = otCoapNewMessage(instance, NULL);
             if (response != NULL) {
-                otCoapCode resp_code = valid ? OT_COAP_CODE_CHANGED
-                                             : OT_COAP_CODE_BAD_REQUEST;
                 otError err = otCoapMessageInitResponse(response, aMessage,
                                                         OT_COAP_TYPE_ACKNOWLEDGMENT,
                                                         resp_code);
                 if (err == OT_ERROR_NONE) {
-                    otCoapMessageSetPayloadMarker(response);
-                    char resp_text[16];
-                    if (valid) {
-                        snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
-                    } else {
-                        snprintf(resp_text, sizeof(resp_text), "ERROR");
-                    }
-                    otMessageAppend(response, resp_text, (uint16_t)strlen(resp_text));
-                    otCoapSendResponse(instance, response, aMessageInfo);
-                    ESP_LOGI(TAG, "Sent CoAP ACK payload: \"%s\"", resp_text);
+                    err = otCoapMessageSetPayloadMarker(response);
+                }
+                char resp_text[16];
+                if (resp_code == OT_COAP_CODE_CHANGED) {
+                    snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
+                } else if (resp_code == OT_COAP_CODE_INTERNAL_ERROR) {
+                    snprintf(resp_text, sizeof(resp_text), "INTERNAL_ERROR");
                 } else {
+                    snprintf(resp_text, sizeof(resp_text), "ERROR");
+                }
+                if (err == OT_ERROR_NONE) {
+                    err = otMessageAppend(response, resp_text, (uint16_t)strlen(resp_text));
+                }
+                if (err == OT_ERROR_NONE) {
+                    err = otCoapSendResponse(instance, response, aMessageInfo);
+                }
+
+                if (err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "Sent CoAP ACK (%d) payload: \"%s\"", resp_code, resp_text);
+                } else {
+                    ESP_LOGE(TAG, "Failed to send CoAP ACK: %d", err);
                     otMessageFree(response);
                 }
             }
@@ -239,6 +302,230 @@ static void coap_server_init(void)
     otCoapStart(instance, OT_DEFAULT_COAP_PORT);
 
     ESP_LOGI(TAG, "CoAP server started - port %d, resource: /light", OT_DEFAULT_COAP_PORT);
+}
+
+/* ========================================================================= */
+/*  SRP Client Registration                                                  */
+/* ========================================================================= */
+
+static otIp6Address s_srp_addr;
+static otSrpClientService s_dimmer_service = {
+    .mName = "_dimmer._udp",
+    .mInstanceName = "dimmer-test-01",
+    .mPort = 5683,
+};
+
+/* Goi khi da giu OpenThread lock va node da attach. */
+static otError dimmer_srp_register_locked(otInstance *instance)
+{
+    otError err = otSrpClientSetHostName(instance, "dimmer-test-01");
+    if (err != OT_ERROR_NONE) {
+        return err;
+    }
+    s_srp_addr = *otThreadGetMeshLocalEid(instance);
+    err = otSrpClientSetHostAddresses(instance, &s_srp_addr, 1);
+    if (err != OT_ERROR_NONE) {
+        return err;
+    }
+    err = otSrpClientAddService(instance, &s_dimmer_service);
+    if (err == OT_ERROR_NONE) {
+        otSrpClientEnableAutoStartMode(instance, NULL, NULL);
+    }
+    return err;
+}
+
+static void dimmer_srp_task(void *pvParameters)
+{
+    (void)pvParameters;
+    otInstance *instance = NULL;
+    while ((instance = esp_openthread_get_instance()) == NULL) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    while (1) {
+        bool attached = false;
+        if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+            otDeviceRole role = otThreadGetDeviceRole(instance);
+            attached = (role == OT_DEVICE_ROLE_CHILD ||
+                        role == OT_DEVICE_ROLE_ROUTER ||
+                        role == OT_DEVICE_ROLE_LEADER);
+            if (attached) {
+                otError err = dimmer_srp_register_locked(instance);
+                if (err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "SRP client registration initiated (dimmer-test-01, _dimmer._udp:5683)");
+                } else {
+                    ESP_LOGE(TAG, "dimmer_srp_register_locked failed: error=%d", (int)err);
+                }
+            }
+            esp_openthread_lock_release();
+        }
+
+        if (attached) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    vTaskDelete(NULL);
+}
+
+/* ========================================================================= */
+/*  Pair Button (BOOT GPIO9) Long Press Handling & Joiner                    */
+/* ========================================================================= */
+
+#define PAIR_BUTTON_GPIO GPIO_NUM_9
+#define PAIR_HOLD_US     INT64_C(2000000)
+
+static QueueHandle_t s_join_result_queue = NULL;
+
+static void pair_join_callback(otError result, void *context)
+{
+    (void)context;
+    if (s_join_result_queue != NULL) {
+        xQueueOverwrite(s_join_result_queue, &result);
+    }
+}
+
+static void pair_try_join(void)
+{
+    if (!esp_openthread_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGE(TAG, "Cannot acquire OpenThread lock for pairing");
+        return;
+    }
+
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        esp_openthread_lock_release();
+        return;
+    }
+
+    if (otDatasetIsCommissioned(instance)) {
+        esp_openthread_lock_release();
+        ESP_LOGI(TAG, "PAIR_SKIPPED_ALREADY_COMMISSIONED");
+        return;
+    }
+
+    /* Bat IPv6 neu chua bat */
+    if (!otIp6IsEnabled(instance)) {
+        otError ip_err = otIp6SetEnabled(instance, true);
+        if (ip_err != OT_ERROR_NONE) {
+            ESP_LOGE(TAG, "PAIR_FAILED: otIp6SetEnabled error=%d", (int)ip_err);
+            esp_openthread_lock_release();
+            return;
+        }
+    }
+
+    /* Xoa event cu trong queue truoc khi bat dau lan ghep moi */
+    if (s_join_result_queue != NULL) {
+        xQueueReset(s_join_result_queue);
+    }
+
+    otError err = otJoinerStart(instance, "P7K4M9", NULL, NULL, NULL, NULL, NULL, pair_join_callback, NULL);
+    esp_openthread_lock_release();
+
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "PAIR_START_FAILED: error=%d", (int)err);
+        return;
+    }
+
+    ESP_LOGI(TAG, "PAIR_STARTED: Joiner running, PSKd=P7K4M9 (waiting up to 60s)...");
+
+    /* Cho ket qua tu callback toi da 60 giay (ngoai OpenThread lock) */
+    otError join_result = OT_ERROR_NONE;
+    BaseType_t recv = xQueueReceive(s_join_result_queue, &join_result, pdMS_TO_TICKS(60000));
+
+    if (recv == pdTRUE) {
+        if (join_result == OT_ERROR_NONE) {
+            if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+                otError th_err = otThreadSetEnabled(instance, true);
+                esp_openthread_lock_release();
+                if (th_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "PAIR_SUCCESS: Commissioning done, Thread enabled!");
+                } else {
+                    ESP_LOGE(TAG, "PAIR_SUCCESS but otThreadSetEnabled failed: %d", (int)th_err);
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "PAIR_FAILED: error=%d", (int)join_result);
+        }
+        return;
+    }
+
+    /* Neu het 60s, lay lai lock va kiem tra queue lan cuoi voi timeout 0 */
+    if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+        if (xQueueReceive(s_join_result_queue, &join_result, 0) == pdTRUE) {
+            if (join_result == OT_ERROR_NONE) {
+                otError th_err = otThreadSetEnabled(instance, true);
+                esp_openthread_lock_release();
+                if (th_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "PAIR_SUCCESS: Commissioning done, Thread enabled!");
+                } else {
+                    ESP_LOGE(TAG, "PAIR_SUCCESS but otThreadSetEnabled failed: %d", (int)th_err);
+                }
+            } else {
+                esp_openthread_lock_release();
+                ESP_LOGE(TAG, "PAIR_FAILED: error=%d", (int)join_result);
+            }
+        } else {
+            otJoinerStop(instance);
+            esp_openthread_lock_release();
+            ESP_LOGW(TAG, "PAIR_TIMEOUT");
+        }
+    }
+}
+
+static void pair_button_task(void *arg)
+{
+    (void)arg;
+    int64_t pressed_since = -1;
+    unsigned released_samples = 0;
+    bool fired = false;
+
+    for (;;) {
+        if (gpio_get_level(PAIR_BUTTON_GPIO) == 0) {
+            released_samples = 0;
+            int64_t now = esp_timer_get_time();
+            if (pressed_since < 0) {
+                pressed_since = now;
+            }
+            if (!fired && now - pressed_since >= PAIR_HOLD_US) {
+                fired = true;
+                ESP_LOGI(TAG, "PAIR_BUTTON_LONG_PRESS");
+                pair_try_join();
+            }
+        } else {
+            pressed_since = -1;
+            // Chỉ cho phép lần nhấn mới sau khi nút đã thả ổn định.
+            if (released_samples < 3 && ++released_samples == 3) {
+                fired = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void pair_button_start(void)
+{
+    s_join_result_queue = xQueueCreate(1, sizeof(otError));
+    if (s_join_result_queue == NULL) {
+        ESP_LOGE(TAG, "Cannot create join result queue");
+        return;
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << PAIR_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    if (xTaskCreate(pair_button_task, "pair_button", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Cannot create pair button task");
+        vQueueDelete(s_join_result_queue);
+        s_join_result_queue = NULL;
+    }
 }
 
 /* ========================================================================= */
@@ -301,7 +588,13 @@ void app_main(void)
     }
     esp_openthread_lock_release();
 
-    /* --- 6. In banner khoi dong --- */
+    /* --- 6. Task tu dong dang ky SRP khi attach vao mang --- */
+    xTaskCreate(dimmer_srp_task, "dimmer_srp", 4096, NULL, 4, NULL);
+
+    /* --- 7. Task xu ly nut nhan BOOT (Pair Button) --- */
+    pair_button_start();
+
+    /* --- 8. In banner khoi dong --- */
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "=============================================");
     ESP_LOGI(TAG, "  NODE DIMMER (CoAP PWM Dimmer) READY!");

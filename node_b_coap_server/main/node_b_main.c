@@ -37,8 +37,15 @@
  */
 
 #include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <string.h>
 #include <strings.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_timer.h"
 
 #include "sdkconfig.h"
 #include "esp_err.h"
@@ -59,6 +66,8 @@
 #include "openthread/ip6.h"
 #include "openthread/message.h"
 #include "openthread/thread.h"
+#include "openthread/srp_client.h"
+#include "openthread/joiner.h"
 #include "ot_examples_common.h"
 
 #define TAG         "NODE_B"
@@ -215,6 +224,230 @@ static void coap_server_init(void)
 }
 
 /* ========================================================================= */
+/*  SRP Client Registration                                                  */
+/* ========================================================================= */
+
+#define NODE_SRP_NAME "relay-01"
+#define NODE_SRP_TYPE "_relay._udp"
+
+static otIp6Address s_node_srp_ipv6;
+static otSrpClientService s_node_srp_service = {
+    .mName         = NODE_SRP_TYPE,
+    .mInstanceName = NODE_SRP_NAME,
+    .mPort         = 5683,
+};
+
+/* Hàm này chỉ được gọi khi đã giữ OpenThread lock. */
+static otError node_srp_register_locked(otInstance *instance)
+{
+    otError err = otSrpClientSetHostName(instance, NODE_SRP_NAME);
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "SRP SetHostName failed: %d", (int)err);
+        return err;
+    }
+    s_node_srp_ipv6 = *otThreadGetMeshLocalEid(instance);
+    err = otSrpClientSetHostAddresses(instance, &s_node_srp_ipv6, 1);
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "SRP SetHostAddresses failed: %d", (int)err);
+        return err;
+    }
+    err = otSrpClientAddService(instance, &s_node_srp_service);
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "SRP AddService failed: %d", (int)err);
+        return err;
+    }
+    otSrpClientEnableAutoStartMode(instance, NULL, NULL);
+    return OT_ERROR_NONE;
+}
+
+static void node_srp_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        bool attempted = false;
+        otError err = OT_ERROR_NONE;
+        if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+            otInstance *instance = esp_openthread_get_instance();
+            if (instance != NULL) {
+                otDeviceRole role = otThreadGetDeviceRole(instance);
+                if (role == OT_DEVICE_ROLE_CHILD || role == OT_DEVICE_ROLE_ROUTER || role == OT_DEVICE_ROLE_LEADER) {
+                    err = node_srp_register_locked(instance);
+                    attempted = true;
+                }
+            }
+            esp_openthread_lock_release();
+        }
+        if (attempted) {
+            if (err == OT_ERROR_NONE) {
+                ESP_LOGI(TAG, "SRP registration initiated: %s (%s)", NODE_SRP_NAME, NODE_SRP_TYPE);
+            }
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+    vTaskDelete(NULL);
+}
+
+/* ========================================================================= */
+/*  Pair Button (BOOT GPIO9) Long Press Handling & Joiner                    */
+/* ========================================================================= */
+
+#define PAIR_BUTTON_GPIO GPIO_NUM_9
+#define PAIR_HOLD_US     INT64_C(2000000)
+
+static QueueHandle_t s_join_result_queue = NULL;
+
+static void pair_join_callback(otError result, void *context)
+{
+    (void)context;
+    if (s_join_result_queue != NULL) {
+        xQueueOverwrite(s_join_result_queue, &result);
+    }
+}
+
+static void pair_try_join(void)
+{
+    if (!esp_openthread_lock_acquire(portMAX_DELAY)) {
+        ESP_LOGE(TAG, "Cannot acquire OpenThread lock for pairing");
+        return;
+    }
+
+    otInstance *instance = esp_openthread_get_instance();
+    if (instance == NULL) {
+        esp_openthread_lock_release();
+        return;
+    }
+
+    if (otDatasetIsCommissioned(instance)) {
+        esp_openthread_lock_release();
+        ESP_LOGI(TAG, "PAIR_SKIPPED_ALREADY_COMMISSIONED");
+        return;
+    }
+
+    /* Bat IPv6 neu chua bat */
+    if (!otIp6IsEnabled(instance)) {
+        otError ip_err = otIp6SetEnabled(instance, true);
+        if (ip_err != OT_ERROR_NONE) {
+            ESP_LOGE(TAG, "PAIR_FAILED: otIp6SetEnabled error=%d", (int)ip_err);
+            esp_openthread_lock_release();
+            return;
+        }
+    }
+
+    /* Xoa event cu trong queue truoc khi bat dau lan ghep moi */
+    if (s_join_result_queue != NULL) {
+        xQueueReset(s_join_result_queue);
+    }
+
+    otError err = otJoinerStart(instance, "R8K4M9", NULL, NULL, NULL, NULL, NULL, pair_join_callback, NULL);
+    esp_openthread_lock_release();
+
+    if (err != OT_ERROR_NONE) {
+        ESP_LOGE(TAG, "PAIR_START_FAILED: error=%d", (int)err);
+        return;
+    }
+
+    ESP_LOGI(TAG, "PAIR_STARTED: Joiner running (waiting up to 60s)...");
+
+    /* Cho ket qua tu callback toi da 60 giay (ngoai OpenThread lock) */
+    otError join_result = OT_ERROR_NONE;
+    BaseType_t recv = xQueueReceive(s_join_result_queue, &join_result, pdMS_TO_TICKS(60000));
+
+    if (recv == pdTRUE) {
+        if (join_result == OT_ERROR_NONE) {
+            if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+                otError th_err = otThreadSetEnabled(instance, true);
+                esp_openthread_lock_release();
+                if (th_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "PAIR_SUCCESS: Commissioning done, Thread enabled!");
+                } else {
+                    ESP_LOGE(TAG, "PAIR_SUCCESS but otThreadSetEnabled failed: %d", (int)th_err);
+                }
+            }
+        } else {
+            ESP_LOGE(TAG, "PAIR_FAILED: error=%d", (int)join_result);
+        }
+        return;
+    }
+
+    /* Neu het 60s, lay lai lock va kiem tra queue lan cuoi voi timeout 0 */
+    if (esp_openthread_lock_acquire(portMAX_DELAY)) {
+        if (xQueueReceive(s_join_result_queue, &join_result, 0) == pdTRUE) {
+            if (join_result == OT_ERROR_NONE) {
+                otError th_err = otThreadSetEnabled(instance, true);
+                esp_openthread_lock_release();
+                if (th_err == OT_ERROR_NONE) {
+                    ESP_LOGI(TAG, "PAIR_SUCCESS: Commissioning done, Thread enabled!");
+                } else {
+                    ESP_LOGE(TAG, "PAIR_SUCCESS but otThreadSetEnabled failed: %d", (int)th_err);
+                }
+            } else {
+                esp_openthread_lock_release();
+                ESP_LOGE(TAG, "PAIR_FAILED: error=%d", (int)join_result);
+            }
+        } else {
+            otJoinerStop(instance);
+            esp_openthread_lock_release();
+            ESP_LOGW(TAG, "PAIR_TIMEOUT");
+        }
+    }
+}
+
+static void pair_button_task(void *arg)
+{
+    (void)arg;
+    int64_t pressed_since = -1;
+    unsigned released_samples = 0;
+    bool fired = false;
+
+    for (;;) {
+        if (gpio_get_level(PAIR_BUTTON_GPIO) == 0) {
+            released_samples = 0;
+            int64_t now = esp_timer_get_time();
+            if (pressed_since < 0) {
+                pressed_since = now;
+            }
+            if (!fired && now - pressed_since >= PAIR_HOLD_US) {
+                fired = true;
+                ESP_LOGI(TAG, "PAIR_BUTTON_LONG_PRESS");
+                pair_try_join();
+            }
+        } else {
+            pressed_since = -1;
+            // Chỉ cho phép lần nhấn mới sau khi nút đã thả ổn định.
+            if (released_samples < 3 && ++released_samples == 3) {
+                fired = false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+static void pair_button_start(void)
+{
+    s_join_result_queue = xQueueCreate(1, sizeof(otError));
+    if (s_join_result_queue == NULL) {
+        ESP_LOGE(TAG, "Cannot create join result queue");
+        return;
+    }
+
+    const gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << PAIR_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+
+    if (xTaskCreate(pair_button_task, "pair_button", 4096, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Cannot create pair button task");
+        vQueueDelete(s_join_result_queue);
+        s_join_result_queue = NULL;
+    }
+}
+
+/* ========================================================================= */
 /*  app_main                                                                 */
 /* ========================================================================= */
 
@@ -274,7 +507,14 @@ void app_main(void)
     }
     esp_openthread_lock_release();
 
-    /* --- 6. In huong dan --- */
+    if (xTaskCreate(node_srp_task, "node_srp", 3072, NULL, 4, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Cannot create SRP task");
+    }
+
+    /* --- 6. Task xu ly nut nhan BOOT (Pair Button) --- */
+    pair_button_start();
+
+    /* --- 7. In huong dan --- */
     ESP_LOGI(TAG, "");
     ESP_LOGI(TAG, "=============================================");
     ESP_LOGI(TAG, "  NODE B (CoAP Relay Server) READY!");
