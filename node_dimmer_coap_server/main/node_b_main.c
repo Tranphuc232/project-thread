@@ -41,7 +41,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "esp_timer.h"
+#include "esp_adc/adc_oneshot.h"
 
 #include "sdkconfig.h"
 #include "esp_err.h"
@@ -82,6 +84,7 @@
 #define LEDC_MAX_DUTY   (1023)             /* 2^10 - 1 = 1023 */
 
 static int s_current_brightness = 0; /* Do sang hien tai: 0 -> 100% */
+static SemaphoreHandle_t s_dimmer_mutex;
 
 static void dimmer_pwm_init(void)
 {
@@ -117,25 +120,156 @@ static esp_err_t dimmer_set_brightness(int brightness)
     if (brightness < 0) brightness = 0;
     if (brightness > 100) brightness = 100;
 
-    /* Cong thuc: duty = brightness * 1023 / 100 */
-    uint32_t duty = (uint32_t)(brightness * LEDC_MAX_DUTY / 100);
-    esp_err_t err = ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ledc_set_duty failed: %s", esp_err_to_name(err));
-        return err;
+    const uint32_t duty = (uint32_t)(brightness * LEDC_MAX_DUTY / 100);
+    xSemaphoreTake(s_dimmer_mutex, portMAX_DELAY);
+    const esp_err_t err = ledc_set_duty_and_update(LEDC_MODE, LEDC_CHANNEL, duty, 0);
+    if (err == ESP_OK) {
+        s_current_brightness = brightness;
     }
-    err = ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ledc_update_duty failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    xSemaphoreGive(s_dimmer_mutex);
 
-    s_current_brightness = brightness;
-    ESP_LOGI(TAG, "============================================");
-    ESP_LOGI(TAG, "  LIGHT level = %d%% | PWM duty = %lu",
-             s_current_brightness, (unsigned long)duty);
-    ESP_LOGI(TAG, "============================================");
-    return ESP_OK;
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "LIGHT level = %d%% | PWM duty = %lu", brightness,
+                 (unsigned long)duty);
+    } else {
+        ESP_LOGE(TAG, "PWM update failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static int dimmer_get_brightness(void)
+{
+    xSemaphoreTake(s_dimmer_mutex, portMAX_DELAY);
+    const int brightness = s_current_brightness;
+    xSemaphoreGive(s_dimmer_mutex);
+    return brightness;
+}
+
+#define POT_GPIO            GPIO_NUM_2
+#define POT_LOG_ONLY        1     /* 1: chỉ đo ADC; 0: cho núm điều khiển đèn */
+#define POT_RAW_MIN         (-1)  /* Điền từ số đo, lấy đầu có raw thấp hơn */
+#define POT_RAW_MAX         (-1)  /* Điền từ số đo, lấy đầu có raw cao hơn */
+#define POT_REVERSE         0     /* Đặt 1 nếu xoay thuận kim làm giảm raw */
+#define POT_SAMPLES         8
+
+#if !POT_LOG_ONLY
+_Static_assert(POT_RAW_MIN >= 0 && POT_RAW_MAX <= 4095 && POT_RAW_MAX > POT_RAW_MIN,
+               "Fill in measured ADC endpoints before setting POT_LOG_ONLY=0");
+
+static int pot_percent(int raw)
+{
+    if (raw < POT_RAW_MIN) raw = POT_RAW_MIN;
+    if (raw > POT_RAW_MAX) raw = POT_RAW_MAX;
+    const int span = POT_RAW_MAX - POT_RAW_MIN;
+    int percent = ((raw - POT_RAW_MIN) * 100 + span / 2) / span;
+    if (POT_REVERSE) percent = 100 - percent;
+    if (percent <= 2) return 0;
+    if (percent >= 98) return 100;
+    return percent;
+}
+
+static int pot_direction(int next, int previous)
+{
+    const int delta = next - previous;
+    const bool reached_end = delta != 0 && (next == 0 || next == 100);
+    if (abs(delta) < 3 && !reached_end) return 0;
+    return delta > 0 ? 1 : -1;
+}
+#endif
+
+static adc_oneshot_unit_handle_t s_pot_adc;
+static adc_channel_t s_pot_channel;
+
+static void dimmer_pot_task(void *arg)
+{
+    (void)arg;
+    TickType_t period = pdMS_TO_TICKS(50);
+    if (period == 0) period = 1;
+
+#if POT_LOG_ONLY
+    unsigned log_counter = 0;
+#else
+    int last_pot = -1;    /* Vị trí núm được chấp nhận, độc lập với CoAP */
+    int direction = 0;
+    unsigned hits = 0;
+#endif
+
+    for (;;) {
+        int sum = 0;
+        bool ok = true;
+        for (int i = 0; i < POT_SAMPLES; ++i) {
+            int raw = 0;
+            if (adc_oneshot_read(s_pot_adc, s_pot_channel, &raw) != ESP_OK) {
+                ok = false;
+                break;
+            }
+            sum += raw;
+        }
+
+#if POT_LOG_ONLY
+        if (ok && ++log_counter == 5) {
+            log_counter = 0;
+            ESP_LOGI(TAG, "POT raw = %d", (sum + POT_SAMPLES / 2) / POT_SAMPLES);
+        }
+#else
+        if (!ok) {
+            direction = 0;
+            hits = 0;
+        } else {
+            const int percent = pot_percent((sum + POT_SAMPLES / 2) / POT_SAMPLES);
+            if (last_pot < 0) {
+                last_pot = percent;
+            } else {
+                const int next = pot_direction(percent, last_pot);
+                if (next == 0) {
+                    direction = 0;
+                    hits = 0;
+                } else {
+                    hits = (direction == next) ? hits + 1 : 1;
+                    direction = next;
+                    if (hits >= 2) {
+                        if (dimmer_set_brightness(percent) == ESP_OK) {
+                            last_pot = percent;
+                            ESP_LOGI(TAG, "POT applied: %d%%", percent);
+                        }
+                        direction = 0;
+                        hits = 0;
+                    }
+                }
+            }
+        }
+#endif
+        vTaskDelay(period);
+    }
+}
+
+static esp_err_t dimmer_pot_start(void)
+{
+    adc_unit_t unit;
+    esp_err_t err = adc_oneshot_io_to_channel(POT_GPIO, &unit, &s_pot_channel);
+    if (err != ESP_OK) return err;
+    if (unit != ADC_UNIT_1) return ESP_ERR_NOT_SUPPORTED;
+
+    const adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = unit,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    const adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    err = adc_oneshot_new_unit(&unit_cfg, &s_pot_adc);
+    if (err != ESP_OK) return err;
+    err = adc_oneshot_config_channel(s_pot_adc, s_pot_channel, &chan_cfg);
+    if (err == ESP_OK &&
+        xTaskCreate(dimmer_pot_task, "dimmer_pot", 4096, NULL, 3, NULL) != pdPASS) {
+        err = ESP_ERR_NO_MEM;
+    }
+    if (err != ESP_OK) {
+        (void)adc_oneshot_del_unit(s_pot_adc);
+        s_pot_adc = NULL;
+    }
+    return err;
 }
 
 /* ========================================================================= */
@@ -158,7 +292,8 @@ static void light_request_handler(void *aContext, otMessage *aMessage,
 
     /* --- 1. Xu ly lenh GET: Doc do sang hien tai (khong thay doi PWM) --- */
     if (code == OT_COAP_CODE_GET) {
-        ESP_LOGI(TAG, "Received GET /light -> current level: %d%%", s_current_brightness);
+        const int brightness = dimmer_get_brightness();
+        ESP_LOGI(TAG, "Received GET /light -> current level: %d%%", brightness);
 
         otMessage *response = otCoapNewMessage(instance, NULL);
         if (response != NULL) {
@@ -173,7 +308,7 @@ static void light_request_handler(void *aContext, otMessage *aMessage,
                 err = otCoapMessageSetPayloadMarker(response);
             }
             char resp_text[16];
-            snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
+            snprintf(resp_text, sizeof(resp_text), "%d", brightness);
             if (err == OT_ERROR_NONE) {
                 err = otMessageAppend(response, resp_text, (uint16_t)strlen(resp_text));
             }
@@ -261,7 +396,7 @@ static void light_request_handler(void *aContext, otMessage *aMessage,
                 }
                 char resp_text[16];
                 if (resp_code == OT_COAP_CODE_CHANGED) {
-                    snprintf(resp_text, sizeof(resp_text), "%d", s_current_brightness);
+                    snprintf(resp_text, sizeof(resp_text), "%d", new_brightness);
                 } else if (resp_code == OT_COAP_CODE_INTERNAL_ERROR) {
                     snprintf(resp_text, sizeof(resp_text), "INTERNAL_ERROR");
                 } else {
@@ -546,6 +681,8 @@ void app_main(void)
 
     /* --- 2. Khoi tao PWM GPIO22 cho Dimmer (Safe Startup: 0% do sang) --- */
     dimmer_pwm_init();
+    s_dimmer_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_dimmer_mutex != NULL ? ESP_OK : ESP_ERR_NO_MEM);
 
     /* --- 3. Bat CLI de cau hinh mang Thread --- */
 #if CONFIG_OPENTHREAD_CLI
@@ -593,6 +730,11 @@ void app_main(void)
 
     /* --- 7. Task xu ly nut nhan BOOT (Pair Button) --- */
     pair_button_start();
+
+    const esp_err_t pot_err = dimmer_pot_start();
+    if (pot_err != ESP_OK) {
+        ESP_LOGW(TAG, "POT unavailable: %s", esp_err_to_name(pot_err));
+    }
 
     /* --- 8. In banner khoi dong --- */
     ESP_LOGI(TAG, "");
